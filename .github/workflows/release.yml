@@ -1,15 +1,14 @@
 name: Release binaries
 
 # Builds the `firn` CLI for each platform and attaches the archives to the
-# GitHub release for the tag. Runs on tag push, when a release is published
-# or edited, or by hand with the tag name.
+# GitHub release for the tag, creating the release if it does not exist.
+# Runs on `v*` and `cli-v*` tag pushes or by hand with the tag name.
 
 on:
   push:
     tags:
       - "v*"
-  release:
-    types: [published, edited]
+      - "cli-v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -20,8 +19,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: release exists
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          case "${{ github.event_name }}" in
+            workflow_dispatch) tag="${{ github.event.inputs.tag }}" ;;
+            *) tag="${GITHUB_REF_NAME}" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Create the release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if gh release view "$tag" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $tag exists"
+          else
+            case "$tag" in
+              cli-v*) title="firn-cli ${tag#cli-v}" ;;
+              *)      title="firn ${tag#v}" ;;
+            esac
+            gh release create "$tag" -R "${{ github.repository }}" --title "$title" --generate-notes --verify-tag
+          fi
+
   build:
     name: ${{ matrix.target }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,20 +67,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - name: Resolve tag
-        id: tag
-        shell: bash
-        run: |
-          case "${{ github.event_name }}" in
-            workflow_dispatch) tag="${{ github.event.inputs.tag }}" ;;
-            release) tag="${{ github.event.release.tag_name }}" ;;
-            *) tag="${GITHUB_REF_NAME}" ;;
-          esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -82,27 +100,18 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ steps.tag.outputs.tag }}" "${{ steps.package.outputs.asset }}" --clobber
+        run: gh release upload "${{ needs.prepare.outputs.tag }}" "${{ steps.package.outputs.asset }}" --clobber
 
   checksums:
     name: checksums
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve tag
-        id: tag
-        run: |
-          case "${{ github.event_name }}" in
-            workflow_dispatch) tag="${{ github.event.inputs.tag }}" ;;
-            release) tag="${{ github.event.release.tag_name }}" ;;
-            *) tag="${GITHUB_REF_NAME}" ;;
-          esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Write SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir dl && cd dl
-          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}" -p 'firn-*'
+          gh release download "${{ needs.prepare.outputs.tag }}" -R "${{ github.repository }}" -p 'firn-*'
           sha256sum firn-* > SHA256SUMS
-          gh release upload "${{ steps.tag.outputs.tag }}" SHA256SUMS -R "${{ github.repository }}" --clobber
+          gh release upload "${{ needs.prepare.outputs.tag }}" SHA256SUMS -R "${{ github.repository }}" --clobber
