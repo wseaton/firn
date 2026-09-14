@@ -11,3 +11,5 @@ Rust client for Snowflake's internal HTTP API. Forked from
 - [`firn-cli`](./firn-cli) — the `firn` binary: a Snowflake CLI for agents
   with one session across calls, cached SSO / MFA tokens, JSON output, and
   an always-on log. See [`firn-cli/README.md`](./firn-cli/README.md).
+
+![firn sql on a terminal](https://raw.githubusercontent.com/wseaton/firn/stable/firn-cli/assets/table.png)

@@ -12,6 +12,7 @@ use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 use serde_json::Value;
 
+use crate::cli::ColorMode;
 use crate::error::CliError;
 
 const NULL: &str = "NULL";
@@ -38,13 +39,18 @@ pub struct Style {
 }
 
 impl Style {
-    /// Colors and attributes only when stdout is a terminal and `NO_COLOR`
-    /// is unset.
-    pub fn detect() -> Self {
-        Self {
-            color: std::io::stdout().is_terminal()
-                && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
-        }
+    /// `Auto` means colors and attributes only when stdout is a terminal
+    /// and `NO_COLOR` is unset.
+    pub fn detect(mode: ColorMode) -> Self {
+        let color = match mode {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => {
+                std::io::stdout().is_terminal()
+                    && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+            }
+        };
+        Self { color }
     }
 
     #[cfg(test)]
@@ -63,13 +69,26 @@ fn base_table(style: &Style, headers: &[String]) -> Table {
         .load_preset(UTF8_FULL_CONDENSED)
         .apply_modifier(UTF8_ROUND_CORNERS)
         .set_content_arrangement(ContentArrangement::Dynamic);
-    if !style.color {
+    if style.color {
+        table.enforce_styling();
+    } else {
         table.force_no_tty();
     }
-    // A pty with no size (CI, some multiplexers) reports 0 columns, which
-    // Dynamic arrangement would squeeze to one character per column.
-    if table.width().is_none_or(|w| w < MIN_WIDTH) {
-        table.set_width(FALLBACK_WIDTH);
+    // `COLUMNS` wins when set (screenshots, odd multiplexers); otherwise a
+    // pty with no size reports 0 columns, which Dynamic arrangement would
+    // squeeze to one character per column, so fall back to something sane.
+    let from_env = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<u16>().ok())
+        .filter(|c| *c >= MIN_WIDTH);
+    match from_env {
+        Some(width) => {
+            table.set_width(width);
+        }
+        None if table.width().is_none_or(|w| w < MIN_WIDTH) => {
+            table.set_width(FALLBACK_WIDTH);
+        }
+        None => {}
     }
     table.set_header(headers.iter().map(|h| {
         let cell = Cell::new(h);
@@ -203,7 +222,7 @@ pub fn render_json_rows(style: &Style, names: &[&str], rows: &[Value]) -> String
 
 /// OSC 8 hyperlink when the terminal can show one, plain text otherwise.
 pub fn hyperlink(style: &Style, url: &str, text: &str) -> String {
-    if style.color && std::io::stderr().is_terminal() {
+    if style.color {
         format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
     } else {
         text.to_owned()

@@ -16,6 +16,11 @@ pub struct Cli {
     #[arg(long, global = true, env = "FIRN_FORMAT", default_value = "auto")]
     pub format: Format,
 
+    /// Colors and terminal links in table output: auto (only on a TTY
+    /// without NO_COLOR), always, or never
+    #[arg(long, global = true, env = "FIRN_COLOR", default_value = "auto")]
+    pub color: ColorMode,
+
     /// Do not read or write the id / MFA token cache
     #[arg(long, global = true, env = "FIRN_NO_CACHE")]
     pub no_cache: bool,
@@ -59,6 +64,13 @@ pub struct ContextOverrides {
     pub schema: Option<String>,
     #[arg(long, global = true, env = "FIRN_ROLE")]
     pub role: Option<String>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

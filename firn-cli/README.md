@@ -3,6 +3,8 @@
 Snowflake command line built for agents and scripts. Same `connections.toml`
 as `snow`, but:
 
+![firn sql on a terminal: typed, colored table with a Snowsight query link](https://raw.githubusercontent.com/wseaton/firn/stable/firn-cli/assets/table.png)
+
 - **One Snowflake session across calls.** The session and master tokens are
   saved (0600) and reused; a dead session is renewed or re-created silently.
 - **SSO once, MFA once.** Browser and MFA logins store the `idToken` /
@@ -26,6 +28,8 @@ firn sql --submit "CALL long_thing()"         # {"query_id": ...}
 firn query wait <id> && firn query fetch <id>
 firn auth status
 ```
+
+![firn sql piped: JSON lines, async submit and wait](https://raw.githubusercontent.com/wseaton/firn/stable/firn-cli/assets/jsonl.png)
 
 ## Connections
 
@@ -57,7 +61,9 @@ account.
 
 Errors go to stderr as `{"error": {"kind", "code", "message"}}` (or a plain
 line in table mode). Colors and links appear only when stdout is a terminal
-and `NO_COLOR` is unset, so piped output never carries escape codes.
+and `NO_COLOR` is unset (`--color always|never` overrides), so piped output
+never carries escape codes. Table width follows the terminal, or `COLUMNS`
+when set.
 
 | exit | meaning |
 | --- | --- |
@@ -99,6 +105,8 @@ printf '[1,"a"]\n[2,"b"]\n' | firn sql "INSERT INTO t VALUES (?, ?)" --rows -
 
 ## Stages
 
+![firn stage put and get, and firn auth status](https://raw.githubusercontent.com/wseaton/firn/stable/firn-cli/assets/stage.png)
+
 `firn stage put local.csv @my_stage/prefix/` gzips (unless the file is
 already compressed or `--no-compress`) and client-side encrypts the file
 exactly as the official drivers do, so Snowflake can `COPY INTO` from it
@@ -116,3 +124,6 @@ official clients show. S3-backed stages only for now.
 
 `firn auth logout` closes and forgets the session; `--tokens` also drops the
 cached id / MFA tokens.
+
+The screenshots are regenerated with [`assets/render.sh`](./assets/render.sh)
+(needs [freeze](https://github.com/charmbracelet/freeze) and a connection).

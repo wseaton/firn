@@ -18,7 +18,7 @@ use crate::output::Output;
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let format = Output::new(cli.format.resolve());
+    let format = Output::new(cli.format.resolve(), cli.color);
 
     let _logger = match logging::init(cli.verbose, cli.trace) {
         Ok(handle) => Some(handle),

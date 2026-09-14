@@ -11,7 +11,7 @@ use futures::StreamExt;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::cli::Format;
+use crate::cli::{ColorMode, Format};
 use crate::error::CliError;
 use crate::table::{self, Style};
 
@@ -19,13 +19,15 @@ use crate::table::{self, Style};
 /// turns query ids into Snowsight links on a terminal.
 pub struct Output {
     pub format: Resolved,
+    pub color: ColorMode,
     pub account: Option<String>,
 }
 
 impl Output {
-    pub fn new(format: Resolved) -> Self {
+    pub fn new(format: Resolved, color: ColorMode) -> Self {
         Self {
             format,
+            color,
             account: None,
         }
     }
@@ -33,6 +35,7 @@ impl Output {
     pub fn with_account(&self, account: Option<String>) -> Self {
         Self {
             format: self.format,
+            color: self.color,
             account,
         }
     }
@@ -233,7 +236,7 @@ fn emit_batches(out: &Output, meta: &Meta, batches: Vec<RecordBatch>) -> Result<
             Ok(())
         }
         Resolved::Table => {
-            let style = Style::detect();
+            let style = Style::detect(out.color);
             writeln!(stdout, "{}", table::render_batches(&style, &batches)?)?;
             drop(stdout);
             emit_meta_stderr_human(out, &style, meta)
@@ -296,7 +299,7 @@ fn emit_json_rows(out: &Output, meta: &Meta, json: &JsonResult) -> Result<(), Cl
             emit_meta_stderr(meta)
         }
         Resolved::Table => {
-            let style = Style::detect();
+            let style = Style::detect(out.color);
             writeln!(stdout, "{}", table::render_json_rows(&style, &names, &rows))?;
             drop(stdout);
             emit_meta_stderr_human(out, &style, meta)
