@@ -41,6 +41,7 @@ jobs:
         run: cargo test -p firn -p firn-cli --all-features
 
       - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
           crate_version=$(cargo pkgid -p firn | sed -E 's/.*[#@]([0-9].*)/\1/')
@@ -53,14 +54,10 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
+      # Each crate is published only if its version is not on crates.io yet,
+      # so a re-run (or a crate-only release) never fails on the other one.
       - name: cargo publish firn
-        run: cargo publish -p firn --token ${{ steps.auth.outputs.token }}
+        run: .github/publish-if-new.sh firn ${{ steps.auth.outputs.token }}
 
       - name: cargo publish firn-cli
-        run: |
-          cli_version=$(cargo pkgid -p firn-cli | sed -E 's/.*[#@]([0-9].*)/\1/')
-          if cargo info "firn-cli@${cli_version}" >/dev/null 2>&1; then
-            echo "firn-cli ${cli_version} is already published; skipping"
-            exit 0
-          fi
-          cargo publish -p firn-cli --token ${{ steps.auth.outputs.token }}
+        run: .github/publish-if-new.sh firn-cli ${{ steps.auth.outputs.token }}
