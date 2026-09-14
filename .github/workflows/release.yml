@@ -1,0 +1,108 @@
+name: Release binaries
+
+# Builds the `firn` CLI for each platform and attaches the archives to the
+# GitHub release for the tag. Runs on tag push, when a release is published
+# or edited, or by hand with the tag name.
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.17.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          case "${{ github.event_name }}" in
+            workflow_dispatch) tag="${{ github.event.inputs.tag }}" ;;
+            release) tag="${{ github.event.release.tag_name }}" ;;
+            *) tag="${GITHUB_REF_NAME}" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p firn-cli --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          version=$(cargo pkgid -p firn-cli | sed -E 's/.*[#@]([0-9].*)/\1/')
+          name="firn-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp firn-cli/README.md LICENSE "dist/${name}/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/firn.exe" "dist/${name}/"
+            (cd dist && 7z a -tzip "${name}.zip" "${name}" >/dev/null)
+            echo "asset=dist/${name}.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp "target/${{ matrix.target }}/release/firn" "dist/${name}/"
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            echo "asset=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.tag.outputs.tag }}" "${{ steps.package.outputs.asset }}" --clobber
+
+  checksums:
+    name: checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          case "${{ github.event_name }}" in
+            workflow_dispatch) tag="${{ github.event.inputs.tag }}" ;;
+            release) tag="${{ github.event.release.tag_name }}" ;;
+            *) tag="${GITHUB_REF_NAME}" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Write SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dl && cd dl
+          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}" -p 'firn-*'
+          sha256sum firn-* > SHA256SUMS
+          gh release upload "${{ steps.tag.outputs.tag }}" SHA256SUMS -R "${{ github.repository }}" --clobber
