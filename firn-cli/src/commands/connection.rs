@@ -5,9 +5,9 @@ use serde_json::{json, Value};
 use crate::cli::{Cli, ConnectionCommand};
 use crate::client::{Client, Target};
 use crate::error::CliError;
-use crate::output::{emit_value, Resolved};
+use crate::output::{emit_value, Output};
 
-pub async fn run(cli: &Cli, cmd: &ConnectionCommand, format: Resolved) -> Result<(), CliError> {
+pub async fn run(cli: &Cli, cmd: &ConnectionCommand, out: &Output) -> Result<(), CliError> {
     match cmd {
         ConnectionCommand::List => {
             let dir = config::config_dir()?;
@@ -17,13 +17,13 @@ pub async fn run(cli: &Cli, cmd: &ConnectionCommand, format: Resolved) -> Result
                 .iter()
                 .map(|n| json!({"name": n, "default": *n == default}))
                 .collect();
-            emit_value(format, &json!({"config_dir": dir, "connections": rows}))
+            emit_value(out, &json!({"config_dir": dir, "connections": rows}))
         }
         ConnectionCommand::Show => {
             let target = Target::resolve(cli)?;
             let c = &target.config;
             emit_value(
-                format,
+                out,
                 &json!({
                     "name": c.name,
                     "account": c.account,
@@ -48,6 +48,7 @@ pub async fn run(cli: &Cli, cmd: &ConnectionCommand, format: Resolved) -> Result
         }
         ConnectionCommand::Test => {
             let client = Client::connect(cli, false).await?;
+            let out = &out.with_account(client.account.clone());
             let result = client
                 .api
                 .exec(
@@ -74,7 +75,7 @@ pub async fn run(cli: &Cli, cmd: &ConnectionCommand, format: Resolved) -> Result
                     }
                 }
             }
-            emit_value(format, &report)
+            emit_value(out, &report)
         }
     }
 }

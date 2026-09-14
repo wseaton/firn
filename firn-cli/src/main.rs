@@ -5,6 +5,7 @@ mod error;
 mod logging;
 mod output;
 mod session_store;
+mod table;
 
 use std::process::ExitCode;
 
@@ -12,12 +13,12 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command, LogsCommand};
 use crate::error::CliError;
-use crate::output::Resolved;
+use crate::output::Output;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let format = cli.format.resolve();
+    let format = Output::new(cli.format.resolve());
 
     let _logger = match logging::init(cli.verbose, cli.trace) {
         Ok(handle) => Some(handle),
@@ -27,11 +28,11 @@ async fn main() -> ExitCode {
         }
     };
 
-    match dispatch(&cli, format).await {
+    match dispatch(&cli, &format).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log::error!("{e}");
-            if format.is_json() {
+            if format.format.is_json() {
                 eprintln!("{}", e.to_json());
             } else {
                 eprintln!("error: {e}");
@@ -41,13 +42,13 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn dispatch(cli: &Cli, format: Resolved) -> Result<(), CliError> {
+async fn dispatch(cli: &Cli, out: &Output) -> Result<(), CliError> {
     match &cli.command {
-        Command::Sql(args) => commands::sql::run(cli, args, format).await,
-        Command::Query(cmd) => commands::query::run(cli, cmd, format).await,
-        Command::Auth(cmd) => commands::auth::run(cli, cmd, format).await,
-        Command::Connection(cmd) => commands::connection::run(cli, cmd, format).await,
-        Command::Stage(cmd) => commands::stage::run(cli, cmd, format).await,
+        Command::Sql(args) => commands::sql::run(cli, args, out).await,
+        Command::Query(cmd) => commands::query::run(cli, cmd, out).await,
+        Command::Auth(cmd) => commands::auth::run(cli, cmd, out).await,
+        Command::Connection(cmd) => commands::connection::run(cli, cmd, out).await,
+        Command::Stage(cmd) => commands::stage::run(cli, cmd, out).await,
         Command::Logs(LogsCommand::Path) => {
             println!("{}", logging::log_dir()?.display());
             Ok(())

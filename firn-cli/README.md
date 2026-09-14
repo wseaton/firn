@@ -53,10 +53,11 @@ account.
 | `jsonl` (default when piped) | one JSON object per row | one JSON line: `query_id`, `rows`, `columns`, context |
 | `json` | `{"meta": {...}, "rows": [...]}` | nothing |
 | `csv` | header + rows | metadata line |
-| `table` (default on a TTY) | pretty table | `N rows, query_id ...` |
+| `table` (default on a TTY) | Unicode table fitted to the terminal: numbers right-aligned, NULLs dimmed, booleans and timestamps colored | `N rows, query_id ...`, the id linking to Snowsight query history in terminals with OSC 8 (Ghostty, Kitty, WezTerm, iTerm2) |
 
 Errors go to stderr as `{"error": {"kind", "code", "message"}}` (or a plain
-line in table mode).
+line in table mode). Colors and links appear only when stdout is a terminal
+and `NO_COLOR` is unset, so piped output never carries escape codes.
 
 | exit | meaning |
 | --- | --- |

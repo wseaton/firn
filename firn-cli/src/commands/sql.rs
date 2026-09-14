@@ -8,9 +8,9 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::{Cli, SqlArgs};
 use crate::client::Client;
 use crate::error::CliError;
-use crate::output::{self, emit_result, emit_value, Resolved};
+use crate::output::{self, emit_result, emit_value, Output, Resolved};
 
-pub async fn run(cli: &Cli, args: &SqlArgs, format: Resolved) -> Result<(), CliError> {
+pub async fn run(cli: &Cli, args: &SqlArgs, out: &Output) -> Result<(), CliError> {
     let sql = read_sql(args)?;
     let binds = collect_binds(args)?;
     let params = args
@@ -20,6 +20,7 @@ pub async fn run(cli: &Cli, args: &SqlArgs, format: Resolved) -> Result<(), CliE
         .collect::<Result<Vec<_>, _>>()?;
 
     let client = Client::connect(cli, false).await?;
+    let out = &out.with_account(client.account.clone());
     let cancel = CancellationToken::new();
     let started = std::time::Instant::now();
     let work = async {
@@ -33,12 +34,12 @@ pub async fn run(cli: &Cli, args: &SqlArgs, format: Resolved) -> Result<(), CliE
         if args.describe {
             let schema = query.describe().await?;
             let columns: Vec<output::Column> = schema.iter().map(Into::into).collect();
-            return emit_value(format, &columns);
+            return emit_value(out, &columns);
         }
         if args.submit {
             let handle = query.submit_async().await?;
             return emit_value(
-                format,
+                out,
                 &json!({"query_id": handle.query_id, "request_id": handle.request_id.to_string()}),
             );
         }
@@ -49,16 +50,16 @@ pub async fn run(cli: &Cli, args: &SqlArgs, format: Resolved) -> Result<(), CliE
                 query.execute_multi_exact(count).await?
             };
             for result in results {
-                emit_result(format, result)?;
+                emit_result(out, result)?;
             }
             return Ok(());
         }
-        match format {
+        match out.format {
             Resolved::Jsonl | Resolved::Csv => {
                 let (metadata, stream) = query.execute_stream().await?;
-                output::emit_stream(format, &metadata, stream).await
+                output::emit_stream(out, &metadata, stream).await
             }
-            Resolved::Json | Resolved::Table => emit_result(format, query.execute().await?),
+            Resolved::Json | Resolved::Table => emit_result(out, query.execute().await?),
         }
     };
 

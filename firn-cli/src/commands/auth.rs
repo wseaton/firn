@@ -4,18 +4,19 @@ use serde_json::json;
 use crate::cli::{AuthCommand, Cli};
 use crate::client::{Client, Target};
 use crate::error::CliError;
-use crate::output::{emit_value, Resolved};
+use crate::output::{emit_value, Output};
 use crate::session_store::SessionStore;
 
-pub async fn run(cli: &Cli, cmd: &AuthCommand, format: Resolved) -> Result<(), CliError> {
+pub async fn run(cli: &Cli, cmd: &AuthCommand, out: &Output) -> Result<(), CliError> {
     match cmd {
         AuthCommand::Login => {
             let client = Client::connect(cli, true).await?;
+            let out = &out.with_account(client.account.clone());
             let result = client.api.exec("SELECT CURRENT_SESSION()").await?;
             client.finish();
             let snapshot = client.api.session_snapshot();
             emit_value(
-                format,
+                out,
                 &json!({
                     "logged_in": true,
                     "query_id": result.metadata.query_id,
@@ -36,7 +37,7 @@ pub async fn run(cli: &Cli, cmd: &AuthCommand, format: Resolved) -> Result<(), C
                 Ok(cache.get(&target.credential_key(kind)?)?.is_some())
             };
             emit_value(
-                format,
+                out,
                 &json!({
                     "connection": target.config.name,
                     "host": target.host,
@@ -72,7 +73,7 @@ pub async fn run(cli: &Cli, cmd: &AuthCommand, format: Resolved) -> Result<(), C
                 }
             }
             emit_value(
-                format,
+                out,
                 &json!({
                     "session_closed": closed,
                     "session_removed": removed,

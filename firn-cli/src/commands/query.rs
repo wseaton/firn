@@ -6,14 +6,15 @@ use serde_json::json;
 use crate::cli::{Cli, QueryCommand};
 use crate::client::Client;
 use crate::error::CliError;
-use crate::output::{emit_result, emit_value, Resolved};
+use crate::output::{emit_result, emit_value, Output};
 
-pub async fn run(cli: &Cli, cmd: &QueryCommand, format: Resolved) -> Result<(), CliError> {
+pub async fn run(cli: &Cli, cmd: &QueryCommand, out: &Output) -> Result<(), CliError> {
     let client = Client::connect(cli, false).await?;
+    let out = &out.with_account(client.account.clone());
     let outcome = match cmd {
         QueryCommand::Status { query_id } => {
             let status = client.api.query_status(query_id).await?;
-            emit_value(format, &status_json(query_id, &status))
+            emit_value(out, &status_json(query_id, &status))
         }
         QueryCommand::Wait {
             query_id,
@@ -24,7 +25,7 @@ pub async fn run(cli: &Cli, cmd: &QueryCommand, format: Resolved) -> Result<(), 
             loop {
                 let status = client.api.query_status(query_id).await?;
                 if status.is_terminal() {
-                    emit_value(format, &status_json(query_id, &status))?;
+                    emit_value(out, &status_json(query_id, &status))?;
                     break if status.is_success() {
                         Ok(())
                     } else {
@@ -45,11 +46,11 @@ pub async fn run(cli: &Cli, cmd: &QueryCommand, format: Resolved) -> Result<(), 
         }
         QueryCommand::Fetch { query_id } => {
             let result = client.api.fetch_results(query_id).await?;
-            emit_result(format, result)
+            emit_result(out, result)
         }
         QueryCommand::Cancel { query_id } => {
             client.api.cancel_query_by_id(query_id).await?;
-            emit_value(format, &json!({"query_id": query_id, "cancelled": true}))
+            emit_value(out, &json!({"query_id": query_id, "cancelled": true}))
         }
     };
     client.finish();

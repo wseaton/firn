@@ -73,6 +73,8 @@ impl Target {
 
 pub struct Client {
     pub api: SnowflakeApi,
+    /// Account identifier, for Snowsight links in table output.
+    pub account: Option<String>,
     store: Option<SessionStore>,
     restored: bool,
 }
@@ -142,6 +144,7 @@ impl Client {
         );
         Ok(Self {
             api: builder.build()?,
+            account: target.config.account.clone(),
             store,
             restored,
         })

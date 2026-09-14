@@ -309,11 +309,13 @@ async fn sql_json_csv_and_table_formats() {
     let out = sb.firn(&["--format", "table", "sql", "SELECT 1"]);
     assert!(out.status.success());
     let text = stdout(&out);
-    assert!(text.contains("| ID | NAME | PRICE | AT "), "{text}");
-    assert!(
-        text.contains("| 1  | ann  | 1.50  | 2023-11-14T22:13:20.500"),
-        "{text}"
-    );
+    assert!(text.starts_with('╭'), "{text}");
+    assert!(text.contains("│ ID"), "{text}");
+    assert!(text.contains("ann"), "{text}");
+    assert!(text.contains("1.50"), "{text}");
+    assert!(text.contains("2023-11-14T22:13:20.500"), "{text}");
+    assert!(text.contains("NULL"), "{text}");
+    assert!(!text.contains('\x1b'), "no escapes when piped: {text}");
     assert!(
         stderr(&out).contains("2 rows, query_id 01b00000"),
         "{}",
