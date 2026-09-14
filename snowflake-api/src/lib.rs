@@ -38,32 +38,46 @@ pub use secrecy::SecretString;
 pub use crate::responses::SnowflakeType;
 
 use responses::ExecResponse;
-use session::{AuthError, Session};
+pub use session::SsoUrlHandler;
+pub use session::{AuthError, ClientIdentity};
+use session::{Session, SessionConfig};
+use url::Url;
 
+pub use crate::config::{ConfigError, ConnectionConfig};
 use crate::connection::QueryType;
 use crate::connection::{Connection, ConnectionError, RequestParams};
-pub use crate::requests::Bind;
+pub use crate::requests::{Bind, BindError};
+pub use crate::session::SessionSnapshot;
+#[cfg(feature = "keyring")]
+pub use crate::token_cache::KeyringTokenCache;
+pub use crate::token_cache::{
+    CredentialKey, CredentialKind, FileTokenCache, MemoryTokenCache, TokenCache, TokenCacheError,
+};
 
-use crate::requests::{AbortRequest, ExecRequest};
+use crate::requests::{bindings_map, AbortRequest, ExecRequest};
 use crate::responses::{
     is_query_in_progress, is_query_not_executing, is_session_expired, is_sql_execution_cancelled,
     CancelQueryResponse, ExecResponseRowType, MonitoringResponse, QueryExecResponseData,
 };
-use crate::session::AuthError::MissingEnvArgument;
-
 #[cfg(feature = "browser-auth")]
 mod browser;
 mod cast;
+pub mod config;
 pub mod connection;
+mod convert;
+#[cfg(feature = "cert-auth")]
+pub mod jwt;
 #[cfg(feature = "polars")]
 mod polars;
-mod put;
 mod requests;
 mod responses;
 mod retry;
 mod session;
+pub mod token_cache;
+pub mod transfer;
 
 pub use cast::{cast_structured_batch, cast_structured_batch_with_schema};
+pub use convert::convert_batch;
 
 #[derive(Error, Debug)]
 pub enum SnowflakeApiError {
@@ -72,6 +86,18 @@ pub enum SnowflakeApiError {
 
     #[error(transparent)]
     AuthError(#[from] AuthError),
+
+    #[error(transparent)]
+    ConfigError(#[from] ConfigError),
+
+    #[error(transparent)]
+    BindError(#[from] BindError),
+
+    #[error(transparent)]
+    TransferError(#[from] transfer::TransferError),
+
+    #[error(transparent)]
+    TokenCacheError(#[from] TokenCacheError),
 
     #[error(transparent)]
     ResponseDeserializationError(#[from] base64::DecodeError),
@@ -114,9 +140,6 @@ pub enum SnowflakeApiError {
 
     #[error("Query was cancelled by the caller")]
     QueryCancelled,
-
-    #[error("Streaming is only supported for Arrow responses; got JSON. Use execute()/execute_raw() instead.")]
-    JsonStreamUnsupported,
 
     #[error(transparent)]
     GlobPatternError(#[from] glob::PatternError),
@@ -343,18 +366,23 @@ impl QueryStatus {
     }
 }
 
-/// Decoded `statement_type_id`, mirroring gosnowflake's named constants
-/// (`connection.go` defines exactly these four; everything else is `Other`).
-/// gosnowflake's grouping is intentionally coarse: INSERT / UPDATE / DELETE /
-/// MERGE all map to [`StatementType::Dml`] by way of being inside the
-/// `[0x3000, 0x3500]` range. If you need finer granularity, compare against
-/// the raw [`QueryMetadata::statement_type_id`] integer directly.
+/// Decoded `statement_type_id`, mirroring gosnowflake's `connection.go`
+/// constants. Codes outside that table land in `Other`; compare against the
+/// raw [`QueryMetadata::statement_type_id`] integer when you need them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementType {
     /// `0x1000` (4096). Pure read query.
     Select,
-    /// `0x3000` (12288). Generic DML: INSERT / UPDATE / DELETE / MERGE.
+    /// `0x3000` (12288). Generic DML envelope.
     Dml,
+    /// `0x3100` (12544).
+    Insert,
+    /// `0x3200` (12800).
+    Update,
+    /// `0x3300` (13056).
+    Delete,
+    /// `0x3400` (13312).
+    Merge,
     /// `0x3500` (13568). Multi-table INSERT (the `INSERT ALL` form).
     MultiTableInsert,
     /// `0xA000` (40960). Multi-statement parent envelope. Note: gosnowflake
@@ -368,6 +396,10 @@ pub enum StatementType {
 impl StatementType {
     pub const SELECT: i64 = 0x1000;
     pub const DML: i64 = 0x3000;
+    pub const INSERT: i64 = 0x3100;
+    pub const UPDATE: i64 = 0x3200;
+    pub const DELETE: i64 = 0x3300;
+    pub const MERGE: i64 = 0x3400;
     pub const MULTI_TABLE_INSERT: i64 = 0x3500;
     pub const MULTISTATEMENT: i64 = 0xA000;
 
@@ -376,6 +408,10 @@ impl StatementType {
         match v {
             Self::SELECT => Self::Select,
             Self::DML => Self::Dml,
+            Self::INSERT => Self::Insert,
+            Self::UPDATE => Self::Update,
+            Self::DELETE => Self::Delete,
+            Self::MERGE => Self::Merge,
             Self::MULTI_TABLE_INSERT => Self::MultiTableInsert,
             Self::MULTISTATEMENT => Self::Multistatement,
             other => Self::Other(other),
@@ -387,6 +423,10 @@ impl StatementType {
         match self {
             Self::Select => Self::SELECT,
             Self::Dml => Self::DML,
+            Self::Insert => Self::INSERT,
+            Self::Update => Self::UPDATE,
+            Self::Delete => Self::DELETE,
+            Self::Merge => Self::MERGE,
             Self::MultiTableInsert => Self::MULTI_TABLE_INSERT,
             Self::Multistatement => Self::MULTISTATEMENT,
             Self::Other(v) => v,
@@ -394,15 +434,10 @@ impl StatementType {
     }
 
     /// `true` for any code in gosnowflake's DML range (`[0x3000, 0x3500]`),
-    /// covering `Dml` and `MultiTableInsert` plus any unnamed sub-codes
-    /// that fell through to `Other`.
+    /// including unnamed sub-codes that fell through to `Other`.
     #[must_use]
     pub fn is_dml(self) -> bool {
-        match self {
-            Self::Dml | Self::MultiTableInsert => true,
-            Self::Other(c) => (Self::DML..=Self::MULTI_TABLE_INSERT).contains(&c),
-            _ => false,
-        }
+        (Self::DML..=Self::MULTI_TABLE_INSERT).contains(&self.code())
     }
 }
 
@@ -446,9 +481,30 @@ const DEFAULT_PREFETCH_CHUNKS: usize = 4;
 /// Recognizes a leading `PUT` statement (case-insensitive, optionally
 /// preceded by block comments). Compiled once on first use; PUT detection
 /// runs on every `exec_raw` call so amortizing the compile is meaningful.
-fn put_regex() -> &'static Regex {
+/// `PUT` and `GET` are answered with transfer instructions instead of rows;
+/// the client does the upload or download itself.
+fn transfer_kind(sql: &str) -> Option<TransferKind> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(?:/\*.*\*/\s*)*put\s+").expect("static regex compiles"))
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)^(?:/\*.*\*/\s*)*(put|get)\s+").expect("static regex compiles")
+    });
+    match re
+        .captures(sql)?
+        .get(1)?
+        .as_str()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "put" => Some(TransferKind::Put),
+        "get" => Some(TransferKind::Get),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferKind {
+    Put,
+    Get,
 }
 
 enum ResolvedArrowResult {
@@ -506,7 +562,7 @@ fn metadata_and_body_from(
     data: QueryExecResponseData,
 ) -> Result<(QueryMetadata, ResolvedArrowResult), SnowflakeApiError> {
     let inline_present = data.rowset_base64.as_ref().is_some_and(|s| !s.is_empty());
-    let total_chunks = Some(data.chunks.len() + usize::from(inline_present));
+    let total_chunks = data.chunks.len() + usize::from(inline_present);
 
     let result_ids = data
         .result_ids
@@ -525,7 +581,7 @@ fn metadata_and_body_from(
     let metadata = QueryMetadata {
         query_id: data.query_id,
         total_rows: Some(data.total),
-        total_chunks,
+        total_chunks: Some(total_chunks),
         statement_type_id: Some(data.statement_type_id),
         warehouse: data.final_warehouse_name,
         database: data.final_database_name,
@@ -534,6 +590,14 @@ fn metadata_and_body_from(
         result_ids,
         column_schema: column_schema.clone(),
     };
+
+    log::debug!(
+        "query {} done: {} rows, {} chunks, statement_type {}",
+        metadata.query_id,
+        data.total,
+        total_chunks,
+        data.statement_type_id
+    );
 
     let body = if data.returned == 0 {
         ResolvedArrowResult::Empty
@@ -560,6 +624,44 @@ fn metadata_and_body_from(
     Ok((metadata, body))
 }
 
+/// Non-Arrow results (DML / DDL row counts, `SHOW` output on some
+/// accounts) arrive as a JSON array of string rows. Re-encode them as one
+/// Arrow IPC stream of Utf8 columns so the streaming paths have a single
+/// shape and never have to re-run the statement.
+fn json_result_to_ipc(json: &JsonResult) -> Result<Bytes, SnowflakeApiError> {
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
+
+    let rows = json
+        .value
+        .as_array()
+        .ok_or(SnowflakeApiError::BrokenResponse)?;
+    let fields: Vec<Field> = json
+        .schema
+        .iter()
+        .map(|f| Field::new(&f.name, DataType::Utf8, true))
+        .collect();
+    let columns: Vec<arrow_array::ArrayRef> = (0..fields.len())
+        .map(|col| {
+            let values = rows.iter().map(|row| match row.get(col) {
+                Some(serde_json::Value::Null) | None => None,
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(other) => Some(other.to_string()),
+            });
+            Arc::new(StringArray::from_iter(values)) as arrow_array::ArrayRef
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &schema)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+    }
+    Ok(Bytes::from(buf))
+}
+
 fn build_record_batch_stream(raw: ArrowChunkStream) -> RecordBatchStream {
     raw.flat_map(|item| match item {
         Err(e) => stream::iter(vec![Err(e)]).boxed(),
@@ -567,8 +669,8 @@ fn build_record_batch_stream(raw: ArrowChunkStream) -> RecordBatchStream {
             Err(e) => stream::iter(vec![Err(SnowflakeApiError::from(e))]).boxed(),
             Ok(reader) => stream::iter(
                 reader
-                    .map(|r| r.map_err(SnowflakeApiError::from))
-                    .collect::<Vec<_>>(),
+                    .map(|r| Ok(convert_batch(&r?)?))
+                    .collect::<Vec<Result<RecordBatch, SnowflakeApiError>>>(),
             )
             .boxed(),
         },
@@ -636,12 +738,19 @@ impl RawQueryResult {
         Ok(res)
     }
 
+    /// Decode one Arrow IPC chunk and convert Snowflake's encoding (scaled
+    /// integers, `{epoch, fraction}` structs) to native Arrow types; see
+    /// [`convert_batch`].
     fn bytes_to_batches(bytes: Bytes) -> Result<Vec<RecordBatch>, ArrowError> {
         let record_batches = StreamReader::try_new(bytes.reader(), None)?;
-        record_batches.into_iter().collect()
+        record_batches
+            .into_iter()
+            .map(|batch| convert_batch(&batch?))
+            .collect()
     }
 }
 
+/// Connection parameters shared by every auth method.
 pub struct AuthArgs {
     pub account_identifier: String,
     pub warehouse: Option<String>,
@@ -650,88 +759,80 @@ pub struct AuthArgs {
     pub username: String,
     pub role: Option<String>,
     pub auth_type: AuthType,
+    /// Where to send requests. `None` derives
+    /// `https://{account_identifier}.snowflakecomputing.com/`; set it for
+    /// private link hosts, custom ports, or a local test server.
+    pub base_url: Option<Url>,
 }
 
 impl AuthArgs {
+    pub fn new(
+        account_identifier: impl Into<String>,
+        username: impl Into<String>,
+        auth_type: AuthType,
+    ) -> Self {
+        Self {
+            account_identifier: account_identifier.into(),
+            warehouse: None,
+            database: None,
+            schema: None,
+            username: username.into(),
+            role: None,
+            auth_type,
+            base_url: None,
+        }
+    }
+
+    /// Build from `SNOWFLAKE_*` environment variables. See
+    /// [`ConnectionConfig::from_env`] for the key list and
+    /// [`ConnectionConfig::into_auth_args`] for how the auth method is chosen.
     pub fn from_env() -> Result<AuthArgs, SnowflakeApiError> {
-        let authenticator = std::env::var("SNOWFLAKE_AUTHENTICATOR")
-            .ok()
-            .map(|s| s.to_lowercase());
+        Ok(ConnectionConfig::from_env()?.into_auth_args()?)
+    }
 
-        let auth_type = match authenticator.as_deref() {
-            #[cfg(feature = "browser-auth")]
-            Some("externalbrowser") => Ok(AuthType::ExternalBrowser),
-            Some("oauth") => {
-                let token = std::env::var("SNOWFLAKE_TOKEN")
-                    .map_err(|_| MissingEnvArgument("SNOWFLAKE_TOKEN".to_owned()))?;
-                Ok(AuthType::OAuth(OAuthArgs {
-                    token: SecretString::from(token),
-                }))
-            }
-            _ => {
-                // Fall back to password / cert / oauth based on which secret is set
-                if let Ok(password) = std::env::var("SNOWFLAKE_PASSWORD") {
-                    Ok(AuthType::Password(PasswordArgs {
-                        password: SecretString::from(password),
-                    }))
-                } else if let Ok(private_key_pem) = std::env::var("SNOWFLAKE_PRIVATE_KEY") {
-                    Ok(AuthType::Certificate(CertificateArgs {
-                        private_key_pem: SecretString::from(private_key_pem),
-                    }))
-                } else if let Ok(token) = std::env::var("SNOWFLAKE_TOKEN") {
-                    Ok(AuthType::OAuth(OAuthArgs {
-                        token: SecretString::from(token),
-                    }))
-                } else {
-                    #[cfg(feature = "browser-auth")]
-                    {
-                        Err(MissingEnvArgument(
-                            "SNOWFLAKE_PASSWORD, SNOWFLAKE_PRIVATE_KEY, SNOWFLAKE_TOKEN, or SNOWFLAKE_AUTHENTICATOR=externalbrowser|oauth".to_owned(),
-                        ))
-                    }
-                    #[cfg(not(feature = "browser-auth"))]
-                    {
-                        Err(MissingEnvArgument(
-                            "SNOWFLAKE_PASSWORD, SNOWFLAKE_PRIVATE_KEY, or SNOWFLAKE_TOKEN"
-                                .to_owned(),
-                        ))
-                    }
-                }
-            }
+    /// Build from a named connection in `connections.toml` / `config.toml`
+    /// (`None` = the default connection).
+    pub fn from_connection(name: Option<&str>) -> Result<AuthArgs, SnowflakeApiError> {
+        Ok(config::load_connection(name)?.into_auth_args()?)
+    }
+
+    pub fn base_url(&self) -> Result<Url, SnowflakeApiError> {
+        if let Some(url) = &self.base_url {
+            return Ok(url.clone());
+        }
+        let cfg = ConnectionConfig {
+            account: Some(self.account_identifier.clone()),
+            ..ConnectionConfig::default()
         };
-
-        Ok(AuthArgs {
-            account_identifier: std::env::var("SNOWFLAKE_ACCOUNT")
-                .map_err(|_| MissingEnvArgument("SNOWFLAKE_ACCOUNT".to_owned()))?,
-            warehouse: std::env::var("SNOWLFLAKE_WAREHOUSE").ok(),
-            database: std::env::var("SNOWFLAKE_DATABASE").ok(),
-            schema: std::env::var("SNOWFLAKE_SCHEMA").ok(),
-            username: std::env::var("SNOWFLAKE_USER")
-                .map_err(|_| MissingEnvArgument("SNOWFLAKE_USER".to_owned()))?,
-            role: std::env::var("SNOWFLAKE_ROLE").ok(),
-            auth_type: auth_type?,
-        })
+        Ok(cfg.base_url()?)
     }
 }
 
 pub enum AuthType {
-    Password(PasswordArgs),
-    Certificate(CertificateArgs),
-    OAuth(OAuthArgs),
+    /// `AUTHENTICATOR=SNOWFLAKE`. A Duo passcode can ride along for accounts
+    /// that enforce MFA without token caching.
+    Password {
+        password: SecretString,
+        passcode: Option<SecretString>,
+    },
+    /// `AUTHENTICATOR=USERNAME_PASSWORD_MFA`. With a token cache on the
+    /// builder the returned `mfaToken` is stored and replayed so the
+    /// passcode is only needed once per token lifetime.
+    UsernamePasswordMfa {
+        password: SecretString,
+        passcode: Option<SecretString>,
+    },
+    /// Key-pair JWT (`cert-auth` feature).
+    Certificate { private_key_pem: SecretString },
+    /// Pre-obtained OAuth access token.
+    OAuth { token: SecretString },
+    /// Programmatic access token.
+    ProgrammaticAccessToken { token: SecretString },
+    /// External browser SSO (`browser-auth` feature). With a token cache on
+    /// the builder the returned `idToken` is stored and replayed so the
+    /// browser only opens once per token lifetime.
     #[cfg(feature = "browser-auth")]
     ExternalBrowser,
-}
-
-pub struct PasswordArgs {
-    pub password: SecretString,
-}
-
-pub struct CertificateArgs {
-    pub private_key_pem: SecretString,
-}
-
-pub struct OAuthArgs {
-    pub token: SecretString,
 }
 
 /// Default heartbeat interval when `client_session_keep_alive` is enabled
@@ -739,8 +840,7 @@ pub struct OAuthArgs {
 /// (`master_validity / 4`, with `master_validity` defaulting to 4h).
 const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_hours(1);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// <https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L27-L28>
-const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
+const DEFAULT_APPLICATION: &str = "firn";
 
 #[must_use]
 pub struct SnowflakeApiBuilder {
@@ -750,6 +850,11 @@ pub struct SnowflakeApiBuilder {
     connect_timeout: Duration,
     request_timeout: Option<Duration>,
     login_timeout: Duration,
+    token_cache: Option<Arc<dyn TokenCache>>,
+    session_snapshot: Option<SessionSnapshot>,
+    application: String,
+    client_identity: ClientIdentity,
+    sso_url_handler: Option<SsoUrlHandler>,
 }
 
 impl SnowflakeApiBuilder {
@@ -760,8 +865,34 @@ impl SnowflakeApiBuilder {
             keep_alive: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: None,
-            login_timeout: DEFAULT_LOGIN_TIMEOUT,
+            login_timeout: session::DEFAULT_LOGIN_TIMEOUT,
+            token_cache: None,
+            session_snapshot: None,
+            application: DEFAULT_APPLICATION.to_owned(),
+            client_identity: ClientIdentity::default(),
+            sso_url_handler: None,
         }
+    }
+
+    /// Builder from a loaded connection: auth args plus `login_timeout`,
+    /// `application`, and the default token cache when the connection sets
+    /// `client_store_temporary_credential` or `client_request_mfa_token`.
+    pub fn from_connection_config(cfg: ConnectionConfig) -> Result<Self, SnowflakeApiError> {
+        let login_timeout = cfg.login_timeout;
+        let application = cfg.application.clone();
+        let wants_cache = cfg.client_store_temporary_credential == Some(true)
+            || cfg.client_request_mfa_token == Some(true);
+        let mut builder = Self::new(cfg.into_auth_args()?);
+        if let Some(t) = login_timeout {
+            builder.login_timeout = t;
+        }
+        if let Some(app) = application {
+            builder.application = app;
+        }
+        if wants_cache {
+            builder = builder.with_default_token_cache()?;
+        }
+        Ok(builder)
     }
 
     pub fn with_client(mut self, client: ClientWithMiddleware) -> Self {
@@ -808,6 +939,49 @@ impl SnowflakeApiBuilder {
         self
     }
 
+    /// Where id / MFA tokens returned by interactive logins are kept between
+    /// processes. Without one, every new `SnowflakeApi` logs in from scratch.
+    pub fn with_token_cache(mut self, cache: Arc<dyn TokenCache>) -> Self {
+        self.token_cache = Some(cache);
+        self
+    }
+
+    /// The OS credential store when the `keyring` feature is on and the
+    /// platform has one (macOS, Windows); otherwise the Python-compatible
+    /// JSON file under `~/.cache/snowflake`.
+    pub fn with_default_token_cache(self) -> Result<Self, SnowflakeApiError> {
+        Ok(self.with_token_cache(default_token_cache()?))
+    }
+
+    /// Adopt a session exported by [`SnowflakeApi::session_snapshot`] so the
+    /// first query reuses it instead of logging in.
+    pub fn with_session_snapshot(mut self, snapshot: SessionSnapshot) -> Self {
+        self.session_snapshot = Some(snapshot);
+        self
+    }
+
+    /// `CLIENT_ENVIRONMENT.APPLICATION` reported at login. Default: `firn`.
+    pub fn with_application(mut self, application: impl Into<String>) -> Self {
+        self.application = application.into();
+        self
+    }
+
+    /// `CLIENT_APP_ID` / `CLIENT_APP_VERSION` reported at login. Defaults
+    /// to the gosnowflake identity this crate has always sent.
+    pub fn with_client_identity(mut self, identity: ClientIdentity) -> Self {
+        self.client_identity = identity;
+        self
+    }
+
+    /// Headless browser SSO: instead of opening a browser, pass the SSO URL
+    /// to `handler` (print it, send it over SSH, ...). The login still
+    /// completes through the local callback once the user opens the URL
+    /// anywhere.
+    pub fn with_sso_url_handler(mut self, handler: SsoUrlHandler) -> Self {
+        self.sso_url_handler = Some(handler);
+        self
+    }
+
     pub fn build(self) -> Result<SnowflakeApi, SnowflakeApiError> {
         let connection = if let Some(client) = self.client {
             Arc::new(Connection::new_with_middware(client))
@@ -819,52 +993,29 @@ impl SnowflakeApiBuilder {
             Arc::new(Connection::new_with_middware(builder.build()))
         };
 
-        let mut session = match self.auth.auth_type {
-            AuthType::Password(args) => Session::password_auth(
-                Arc::clone(&connection),
-                &self.auth.account_identifier,
-                self.auth.warehouse.as_deref(),
-                self.auth.database.as_deref(),
-                self.auth.schema.as_deref(),
-                &self.auth.username,
-                self.auth.role.as_deref(),
-                args.password,
-            ),
-            AuthType::Certificate(args) => Session::cert_auth(
-                Arc::clone(&connection),
-                &self.auth.account_identifier,
-                self.auth.warehouse.as_deref(),
-                self.auth.database.as_deref(),
-                self.auth.schema.as_deref(),
-                &self.auth.username,
-                self.auth.role.as_deref(),
-                args.private_key_pem,
-            ),
-            AuthType::OAuth(args) => Session::oauth_auth(
-                Arc::clone(&connection),
-                &self.auth.account_identifier,
-                self.auth.warehouse.as_deref(),
-                self.auth.database.as_deref(),
-                self.auth.schema.as_deref(),
-                &self.auth.username,
-                self.auth.role.as_deref(),
-                args.token,
-            ),
-            #[cfg(feature = "browser-auth")]
-            AuthType::ExternalBrowser => Session::browser_auth(
-                Arc::clone(&connection),
-                &self.auth.account_identifier,
-                self.auth.warehouse.as_deref(),
-                self.auth.database.as_deref(),
-                self.auth.schema.as_deref(),
-                &self.auth.username,
-                self.auth.role.as_deref(),
-            ),
-        };
+        let base_url = self.auth.base_url()?;
+        let session = Session::new(
+            Arc::clone(&connection),
+            SessionConfig {
+                base_url: base_url.clone(),
+                account_identifier: self.auth.account_identifier,
+                username: self.auth.username,
+                warehouse: self.auth.warehouse,
+                database: self.auth.database,
+                schema: self.auth.schema,
+                role: self.auth.role,
+                auth_type: self.auth.auth_type,
+                token_cache: self.token_cache,
+                login_timeout: self.login_timeout,
+                application: self.application,
+                client_identity: self.client_identity,
+                sso_url_handler: self.sso_url_handler,
+            },
+        );
+        if let Some(snapshot) = &self.session_snapshot {
+            session.restore(snapshot);
+        }
 
-        session.set_login_timeout(self.login_timeout);
-
-        let account_identifier = self.auth.account_identifier.to_uppercase();
         let session = Arc::new(session);
         let keep_alive = self
             .keep_alive
@@ -873,9 +1024,21 @@ impl SnowflakeApiBuilder {
         Ok(SnowflakeApi {
             connection: Arc::clone(&connection),
             session,
-            account_identifier,
+            base_url,
             keep_alive,
         })
+    }
+}
+
+/// See [`SnowflakeApiBuilder::with_default_token_cache`].
+pub fn default_token_cache() -> Result<Arc<dyn TokenCache>, TokenCacheError> {
+    #[cfg(all(feature = "keyring", any(target_os = "macos", windows)))]
+    {
+        Ok(Arc::new(KeyringTokenCache::default()))
+    }
+    #[cfg(not(all(feature = "keyring", any(target_os = "macos", windows))))]
+    {
+        Ok(Arc::new(FileTokenCache::from_default_dir()?))
     }
 }
 
@@ -883,7 +1046,7 @@ impl SnowflakeApiBuilder {
 pub struct SnowflakeApi {
     connection: Arc<Connection>,
     session: Arc<Session>,
-    account_identifier: String,
+    base_url: Url,
     // Held for Drop side-effect: cancels the heartbeat task with the API.
     #[allow(dead_code)]
     keep_alive: Option<KeepAliveTask>,
@@ -921,15 +1084,28 @@ impl KeepAliveTask {
 }
 
 impl SnowflakeApi {
-    /// Create a new `SnowflakeApi` object with an existing connection and session.
-    pub fn new(connection: Arc<Connection>, session: Session, account_identifier: String) -> Self {
-        Self {
-            connection,
-            session: Arc::new(session),
-            account_identifier,
-            keep_alive: None,
-        }
+    fn with_auth(
+        account_identifier: &str,
+        warehouse: Option<&str>,
+        database: Option<&str>,
+        schema: Option<&str>,
+        username: &str,
+        role: Option<&str>,
+        auth_type: AuthType,
+    ) -> Result<Self, SnowflakeApiError> {
+        SnowflakeApiBuilder::new(AuthArgs {
+            account_identifier: account_identifier.to_owned(),
+            warehouse: warehouse.map(str::to_owned),
+            database: database.map(str::to_owned),
+            schema: schema.map(str::to_owned),
+            username: username.to_owned(),
+            role: role.map(str::to_owned),
+            auth_type,
+            base_url: None,
+        })
+        .build()
     }
+
     /// Initialize object with password auth. Authentication happens on the first request.
     pub fn with_password_auth(
         account_identifier: &str,
@@ -940,25 +1116,18 @@ impl SnowflakeApi {
         role: Option<&str>,
         password: &str,
     ) -> Result<Self, SnowflakeApiError> {
-        let connection = Arc::new(Connection::new()?);
-
-        let session = Session::password_auth(
-            Arc::clone(&connection),
+        Self::with_auth(
             account_identifier,
             warehouse,
             database,
             schema,
             username,
             role,
-            SecretString::from(password),
-        );
-
-        let account_identifier = account_identifier.to_uppercase();
-        Ok(Self::new(
-            Arc::clone(&connection),
-            session,
-            account_identifier,
-        ))
+            AuthType::Password {
+                password: SecretString::from(password),
+                passcode: None,
+            },
+        )
     }
 
     /// Initialize object with private certificate auth. Authentication happens on the first request.
@@ -971,25 +1140,17 @@ impl SnowflakeApi {
         role: Option<&str>,
         private_key_pem: &str,
     ) -> Result<Self, SnowflakeApiError> {
-        let connection = Arc::new(Connection::new()?);
-
-        let session = Session::cert_auth(
-            Arc::clone(&connection),
+        Self::with_auth(
             account_identifier,
             warehouse,
             database,
             schema,
             username,
             role,
-            SecretString::from(private_key_pem),
-        );
-
-        let account_identifier = account_identifier.to_uppercase();
-        Ok(Self::new(
-            Arc::clone(&connection),
-            session,
-            account_identifier,
-        ))
+            AuthType::Certificate {
+                private_key_pem: SecretString::from(private_key_pem),
+            },
+        )
     }
 
     /// Initialize object with OAuth auth. Authentication happens on the first request.
@@ -1005,31 +1166,24 @@ impl SnowflakeApi {
         role: Option<&str>,
         token: &str,
     ) -> Result<Self, SnowflakeApiError> {
-        let connection = Arc::new(Connection::new()?);
-
-        let session = Session::oauth_auth(
-            Arc::clone(&connection),
+        Self::with_auth(
             account_identifier,
             warehouse,
             database,
             schema,
             username,
             role,
-            SecretString::from(token),
-        );
-
-        let account_identifier = account_identifier.to_uppercase();
-        Ok(Self::new(
-            Arc::clone(&connection),
-            session,
-            account_identifier,
-        ))
+            AuthType::OAuth {
+                token: SecretString::from(token),
+            },
+        )
     }
 
     /// Initialize object with external browser SSO auth. Authentication happens on the first request.
     ///
     /// This will open a browser window for the user to authenticate via their `IdP`.
-    /// Requires the `browser-auth` feature.
+    /// Requires the `browser-auth` feature. Add a token cache via
+    /// [`SnowflakeApiBuilder::with_token_cache`] to skip the browser on later runs.
     #[cfg(feature = "browser-auth")]
     pub fn with_browser_auth(
         account_identifier: &str,
@@ -1039,28 +1193,42 @@ impl SnowflakeApi {
         username: &str,
         role: Option<&str>,
     ) -> Result<Self, SnowflakeApiError> {
-        let connection = Arc::new(Connection::new()?);
-
-        let session = Session::browser_auth(
-            Arc::clone(&connection),
+        Self::with_auth(
             account_identifier,
             warehouse,
             database,
             schema,
             username,
             role,
-        );
-
-        let account_identifier = account_identifier.to_uppercase();
-        Ok(Self::new(
-            Arc::clone(&connection),
-            session,
-            account_identifier,
-        ))
+            AuthType::ExternalBrowser,
+        )
     }
 
     pub fn from_env() -> Result<Self, SnowflakeApiError> {
         SnowflakeApiBuilder::new(AuthArgs::from_env()?).build()
+    }
+
+    /// Connect using a named connection from `connections.toml` / `config.toml`
+    /// (`None` = the default connection).
+    pub fn from_connection(name: Option<&str>) -> Result<Self, SnowflakeApiError> {
+        SnowflakeApiBuilder::from_connection_config(config::load_connection(name)?)?.build()
+    }
+
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    /// Export the live session tokens for reuse by a later process. `None`
+    /// until the first request has logged in, or once the master token has
+    /// expired.
+    pub fn session_snapshot(&self) -> Option<SessionSnapshot> {
+        self.session.snapshot()
+    }
+
+    /// Forget any cached id / MFA token for this user so the next login is
+    /// interactive again.
+    pub fn clear_cached_credentials(&self) -> Result<(), SnowflakeApiError> {
+        Ok(self.session.clear_cached_credentials()?)
     }
 
     /// Closes the current session, this is necessary to clean up temporary objects (tables, functions, etc)
@@ -1080,27 +1248,24 @@ impl SnowflakeApi {
     }
 
     /// Executes a single query against API.
-    /// If statement is PUT, then file will be uploaded to the Snowflake-managed storage
+    /// `PUT` uploads to and `GET` downloads from the stage; both return the
+    /// same per-file result rows Snowflake's own clients show.
     /// Returns raw bytes in the Arrow response
     pub async fn exec_raw(&self, sql: &str) -> Result<RawQueryResult, SnowflakeApiError> {
-        // put commands go through a different flow and result is side-effect
-        if put_regex().is_match(sql) {
-            log::info!("Detected PUT query");
-            let metadata = self.exec_put(sql).await?;
-            Ok(RawQueryResult {
-                metadata,
-                data: RawQueryData::Empty,
-            })
-        } else {
-            self.exec_arrow_raw(sql).await
+        match transfer_kind(sql) {
+            Some(kind) => self.exec_transfer(sql, kind).await,
+            None => self.exec_arrow_raw(sql).await,
         }
     }
 
-    async fn exec_put(&self, sql: &str) -> Result<QueryMetadata, SnowflakeApiError> {
-        let (_, resp) = self
-            .run_sql::<ExecResponse>(sql, QueryType::JsonQuery)
-            .await?;
-        log::debug!("Got PUT response: {resp:?}");
+    async fn exec_transfer(
+        &self,
+        sql: &str,
+        kind: TransferKind,
+    ) -> Result<RawQueryResult, SnowflakeApiError> {
+        log::info!("running {kind:?} transfer");
+        let (_, resp) = self.run_sql(sql, QueryType::JsonQuery).await?;
+        log::trace!("Got {kind:?} response: {resp:?}");
 
         match resp {
             ExecResponse::Query(_) | ExecResponse::QueryAsync(_) => {
@@ -1119,8 +1284,19 @@ impl SnowflakeApi {
                     role: None,
                     column_schema: Vec::new(),
                 };
-                put::put(pg).await?;
-                Ok(metadata)
+                let rows = match kind {
+                    TransferKind::Put => transfer::put(pg).await?,
+                    TransferKind::Get => transfer::get(pg).await?,
+                };
+                let row_count = rows.value.as_array().map_or(0, Vec::len);
+                Ok(RawQueryResult {
+                    metadata: QueryMetadata {
+                        total_rows: i64::try_from(row_count).ok(),
+                        column_schema: rows.schema.clone(),
+                        ..metadata
+                    },
+                    data: RawQueryData::Json(rows),
+                })
             }
             ExecResponse::Error(e) => Err(SnowflakeApiError::ApiError(
                 e.data.error_code,
@@ -1132,17 +1308,23 @@ impl SnowflakeApi {
     /// Useful for debugging to get the straight query response
     #[cfg(debug_assertions)]
     pub async fn exec_response(&self, sql: &str) -> Result<ExecResponse, SnowflakeApiError> {
-        let (_, resp) = self
-            .run_sql::<ExecResponse>(sql, QueryType::ArrowQuery)
-            .await?;
+        let (_, resp) = self.run_sql(sql, QueryType::ArrowQuery).await?;
         Ok(resp)
     }
 
     /// Useful for debugging to get raw JSON response
     #[cfg(debug_assertions)]
     pub async fn exec_json(&self, sql: &str) -> Result<serde_json::Value, SnowflakeApiError> {
-        let (_, resp) = self
-            .run_sql::<serde_json::Value>(sql, QueryType::JsonQuery)
+        let resp = self
+            .run_sql_with_params::<serde_json::Value>(
+                sql,
+                QueryType::JsonQuery,
+                RequestParams::new(),
+                &[],
+                false,
+                false,
+                HashMap::new(),
+            )
             .await?;
         Ok(resp)
     }
@@ -1222,32 +1404,27 @@ impl SnowflakeApi {
         cancel: &CancellationToken,
         parameters: HashMap<String, serde_json::Value>,
     ) -> Result<RawQueryResult, SnowflakeApiError> {
-        if put_regex().is_match(sql) {
-            // PUT goes through a different non-cancellable flow today. The
-            // caller's token can still be respected before the upload starts;
-            // once we're streaming to S3 we don't currently abort. PUT
+        if let Some(kind) = transfer_kind(sql) {
+            // Transfers go through a different non-cancellable flow today. The
+            // caller's token can still be respected before the transfer starts;
+            // once bytes are moving we don't currently abort. PUT / GET
             // statements don't accept bind parameters.
             if cancel.is_cancelled() {
                 return Err(SnowflakeApiError::QueryCancelled);
             }
             if !binds.is_empty() {
                 return Err(SnowflakeApiError::Unimplemented(
-                    "bind parameters on PUT statements".to_owned(),
+                    "bind parameters on PUT / GET statements".to_owned(),
                 ));
             }
             if !parameters.is_empty() {
-                // PUT doesn't accept session-parameter overrides; surface
+                // PUT / GET don't accept session-parameter overrides; surface
                 // rather than silently drop them.
                 return Err(SnowflakeApiError::Unimplemented(
-                    "session parameter overrides on PUT statements".to_owned(),
+                    "session parameter overrides on PUT / GET statements".to_owned(),
                 ));
             }
-            log::info!("Detected PUT query");
-            let metadata = self.exec_put(sql).await?;
-            Ok(RawQueryResult {
-                metadata,
-                data: RawQueryData::Empty,
-            })
+            self.exec_transfer(sql, kind).await
         } else {
             self.exec_arrow_raw_with_cancel(sql, request_id, binds, cancel, parameters)
                 .await
@@ -1328,7 +1505,7 @@ impl SnowflakeApi {
             .connection
             .request::<CancelQueryResponse>(
                 QueryType::AbortRequest,
-                &self.account_identifier,
+                &self.base_url,
                 &[],
                 Some(&parts.session_token_auth_header),
                 AbortRequest {
@@ -1417,9 +1594,9 @@ impl SnowflakeApi {
         let mut resp = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
-            r = self.run_sql_with_params::<ExecResponse>(sql, QueryType::ArrowQuery, params, binds, false, false, parameters.clone()) => r?,
+            r = self.run_exec(sql, QueryType::ArrowQuery, params, binds, false, false, parameters.clone()) => r?,
         };
-        log::debug!("Got query response: {resp:?}");
+        log::trace!("Got query response: {resp:?}");
 
         // QueryAsync (code 333334) can itself return another QueryAsync; loop
         // until we see a terminal kind.
@@ -1480,7 +1657,7 @@ impl SnowflakeApi {
         let resp = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
-            r = self.run_sql_with_params::<ExecResponse>(
+            r = self.run_exec(
                 sql,
                 QueryType::ArrowQuery,
                 params,
@@ -1538,7 +1715,7 @@ impl SnowflakeApi {
             .connection
             .request::<MonitoringResponse>(
                 QueryType::MonitoringQuery(query_id.to_owned()),
-                &self.account_identifier,
+                &self.base_url,
                 &[],
                 Some(&parts.session_token_auth_header),
                 serde_json::Value::Null,
@@ -1571,8 +1748,7 @@ impl SnowflakeApi {
 
     /// Stream decoded `RecordBatch`es by query id. Blocks until Snowflake
     /// hands back a terminal envelope, then drives chunk downloads with
-    /// bounded prefetch. Errors with [`SnowflakeApiError::JsonStreamUnsupported`]
-    /// for JSON responses.
+    /// bounded prefetch. A JSON-shaped result is yielded as one Utf8 batch.
     pub async fn fetch_results_stream(
         &self,
         query_id: &str,
@@ -1591,7 +1767,9 @@ impl SnowflakeApi {
         let (metadata, body) = self.resolve_fetch_by_id(query_id, &cancel).await?;
         let stream = match body {
             ResolvedArrowResult::Empty => stream::empty().boxed(),
-            ResolvedArrowResult::Json(_) => return Err(SnowflakeApiError::JsonStreamUnsupported),
+            ResolvedArrowResult::Json(json) => {
+                stream::once(std::future::ready(json_result_to_ipc(&json))).boxed()
+            }
             ResolvedArrowResult::Chunked {
                 inline_base64,
                 chunks,
@@ -1696,7 +1874,7 @@ impl SnowflakeApi {
                 () = cancel.cancelled() => return Err(SnowflakeApiError::QueryCancelled),
                 r = self.connection.request::<ExecResponse>(
                     QueryType::ArrowQueryResult(result_path.clone()),
-                    &self.account_identifier,
+                    &self.base_url,
                     &[],
                     Some(&parts.session_token_auth_header),
                     serde_json::Value::Null,
@@ -1744,7 +1922,9 @@ impl SnowflakeApi {
             .await?;
         let stream = match body {
             ResolvedArrowResult::Empty => stream::empty().boxed(),
-            ResolvedArrowResult::Json(_) => return Err(SnowflakeApiError::JsonStreamUnsupported),
+            ResolvedArrowResult::Json(json) => {
+                stream::once(std::future::ready(json_result_to_ipc(&json))).boxed()
+            }
             ResolvedArrowResult::Chunked {
                 inline_base64,
                 chunks,
@@ -1762,14 +1942,14 @@ impl SnowflakeApi {
     /// Run a SQL statement, generating fresh request params. Returns both
     /// the params and the response so callers in the cancellable exec path
     /// can hold onto `params.request_id` for later abort.
-    async fn run_sql<R: serde::de::DeserializeOwned>(
+    async fn run_sql(
         &self,
         sql_text: &str,
         query_type: QueryType,
-    ) -> Result<(RequestParams, R), SnowflakeApiError> {
+    ) -> Result<(RequestParams, ExecResponse), SnowflakeApiError> {
         let params = RequestParams::new();
         let resp = self
-            .run_sql_with_params::<R>(
+            .run_exec(
                 sql_text,
                 query_type,
                 params,
@@ -1803,19 +1983,7 @@ impl SnowflakeApi {
 
         let parts = self.session.get_token().await?;
 
-        // Snowflake's bindings field uses 1-indexed string keys to match `?`
-        // placeholder positions in the SQL. Empty -> serialize as omitted.
-        let bindings = if binds.is_empty() {
-            None
-        } else {
-            Some(
-                binds
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| ((i + 1).to_string(), b.0.clone()))
-                    .collect(),
-            )
-        };
+        let bindings = bindings_map(binds)?;
 
         let body = ExecRequest {
             sql_text: sql_text.to_string(),
@@ -1831,7 +1999,7 @@ impl SnowflakeApi {
             .connection
             .request::<R>(
                 query_type,
-                &self.account_identifier,
+                &self.base_url,
                 &[],
                 Some(&parts.session_token_auth_header),
                 body,
@@ -1840,6 +2008,49 @@ impl SnowflakeApi {
             .await?;
 
         Ok(resp)
+    }
+
+    /// Submit a statement and, if Snowflake answers `390112` (session token
+    /// expired), renew once and resubmit with the same `request_id`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_exec(
+        &self,
+        sql_text: &str,
+        query_type: QueryType,
+        params: RequestParams,
+        binds: &[Bind],
+        describe_only: bool,
+        async_exec: bool,
+        parameters: HashMap<String, serde_json::Value>,
+    ) -> Result<ExecResponse, SnowflakeApiError> {
+        let resp = self
+            .run_sql_with_params::<ExecResponse>(
+                sql_text,
+                query_type.clone(),
+                params,
+                binds,
+                describe_only,
+                async_exec,
+                parameters.clone(),
+            )
+            .await?;
+        match resp {
+            ExecResponse::Error(e) if is_session_expired(e.code.as_ref()) => {
+                log::debug!("Session expired on submit; renewing and retrying once");
+                self.session.force_renew().await?;
+                self.run_sql_with_params::<ExecResponse>(
+                    sql_text,
+                    query_type,
+                    params,
+                    binds,
+                    describe_only,
+                    async_exec,
+                    parameters,
+                )
+                .await
+            }
+            other => Ok(other),
+        }
     }
 
     /// Poll the `get_result_url` endpoint until Snowflake returns a final
@@ -1873,7 +2084,7 @@ impl SnowflakeApi {
                 () = cancel.cancelled() => return self.bail_cancelled(request_id).await,
                 r = self.connection.request::<ExecResponse>(
                     QueryType::ArrowQueryResult(get_result_url.to_owned()),
-                    &self.account_identifier,
+                    &self.base_url,
                     &[],
                     Some(&parts.session_token_auth_header),
                     serde_json::Value::Null,
@@ -1944,6 +2155,14 @@ impl<'a> QueryBuilder<'a> {
         I: IntoIterator<Item = Bind>,
     {
         self.binds.extend(values);
+        self
+    }
+
+    /// Bind a `:name` placeholder. Cannot be combined with positional
+    /// `?` binds in the same statement.
+    #[must_use]
+    pub fn bind_named<B: Into<Bind>>(mut self, name: impl Into<String>, value: B) -> Self {
+        self.binds.push(value.into().named(name));
         self
     }
 
@@ -2044,8 +2263,7 @@ impl<'a> QueryBuilder<'a> {
     /// resolves once Snowflake returns the result envelope (including any
     /// async polling); the returned stream then drives the chunk downloads.
     ///
-    /// Errors with [`SnowflakeApiError::JsonStreamUnsupported`] if the
-    /// response is JSON. Returns an empty stream for empty results.
+    /// A JSON-shaped result (DML, DDL) arrives as one Utf8 batch.
     pub async fn execute_stream(
         self,
     ) -> Result<(QueryMetadata, RecordBatchStream), SnowflakeApiError> {
@@ -2182,7 +2400,7 @@ impl<'a> QueryBuilder<'a> {
         let params = RequestParams::or_new(self.request_id);
         let resp = self
             .api
-            .run_sql_with_params::<ExecResponse>(
+            .run_exec(
                 self.sql,
                 QueryType::JsonQuery,
                 params,
@@ -2309,10 +2527,7 @@ mod tests {
         );
         // Sub-codes inside the DML range fall through to Other but still
         // pass is_dml().
-        assert_eq!(
-            StatementType::from_code(0x3100),
-            StatementType::Other(0x3100)
-        );
+        assert_eq!(StatementType::from_code(0x3100), StatementType::Insert);
     }
 
     #[test]

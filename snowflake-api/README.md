@@ -7,14 +7,14 @@ official drivers use). Forked from
 
 ```toml
 [dependencies]
-firn = "0.15"
+firn = "0.17"
 ```
 
-Default features: `cert-auth`. Optional: `browser-auth`, `polars`.
+Default features: `cert-auth`. Optional: `browser-auth`, `keyring`, `polars`.
 
 ## Quick start
 
-```rust
+```rust,no_run
 use firn::{QueryData, SnowflakeApi};
 
 #[tokio::main]
@@ -33,10 +33,24 @@ async fn main() -> anyhow::Result<()> {
 ## Features
 
 ### Auth
-- password ([`with_password_auth`])
-- key-pair JWT ([`with_certificate_auth`], `cert-auth` feature, default)
-- external-browser SSO ([`with_browser_auth`], `browser-auth` feature)
+- password, optionally with a Duo passcode ([`with_password_auth`], `AuthType::Password`)
+- username + password MFA with cached `mfaToken` replay (`AuthType::UsernamePasswordMfa`)
+- key-pair JWT, plain or passphrase-encrypted PKCS#8 ([`with_certificate_auth`], `cert-auth` feature, default)
+- OAuth access token ([`with_oauth_auth`])
+- programmatic access token (`AuthType::ProgrammaticAccessToken`)
+- external-browser SSO with cached `idToken` replay ([`with_browser_auth`], `browser-auth` feature)
+- `connections.toml` / `config.toml` (`SnowflakeApi::from_connection`, same files and
+  `SNOWFLAKE_*` env overrides as `snow`, the Python connector, and gosnowflake)
 - env-driven ([`from_env`])
+- explicit `host` / `port` / `protocol` for private link and custom endpoints
+
+### Token cache and session hand-off
+- `TokenCache` keeps `idToken` / `mfaToken` between processes: `FileTokenCache`
+  (the Python connector's `credential_cache_v1.json` layout, so `snow` and firn
+  share tokens on Linux) or `KeyringTokenCache` (`keyring` feature: macOS
+  Keychain / Windows Credential Manager, same service name as the Python connector)
+- `SessionSnapshot` exports live session tokens so a short-lived process (a CLI
+  call) can hand its Snowflake session to the next one instead of logging in again
 
 ### Queries
 - single statement ([`run_sql.rs`](./examples/run_sql.rs))
@@ -49,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
 
 ### Results
 - Arrow `RecordBatch`, with streaming and raw-IPC variants ([`streaming.rs`](./examples/streaming.rs))
+- Snowflake's wire encoding converted to native Arrow types (`convert_batch`): `NUMBER(p,s>0)` to
+  `Decimal128`, `TIMESTAMP_*` structs and scaled ints to `Timestamp`, `TIME` to `Time32`/`Time64`.
+  The raw-IPC paths are left untouched.
 - JSON results when the session is configured for JSON
 - per-query `QueryMetadata`: `query_id`, `total_rows`, `total_chunks`, `statement_type_id`, executing warehouse/database/schema/role
 - `cast_structured()` rewrites `MAP` / `OBJECT` / `ARRAY` columns from JSON-in-Utf8 into native Arrow `Map<Utf8, V>` / `List<E>` ([`compound_types.rs`](./examples/compound_types.rs))

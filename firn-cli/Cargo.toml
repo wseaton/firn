@@ -1,0 +1,46 @@
+[package]
+name = "firn-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Will Eaton <me@wseaton.com>"]
+description = "Snowflake CLI built for agents: one session across calls, cached SSO and MFA tokens, JSON output, always-on logs"
+license = "Apache-2.0"
+repository = "https://github.com/wseaton/firn"
+keywords = ["snowflake", "cli", "database"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "firn"
+path = "src/main.rs"
+
+[dependencies]
+firn = { path = "../snowflake-api", version = "0.17", features = [
+    "cert-auth",
+    "browser-auth",
+    "keyring",
+] }
+arrow = { version = "58", features = ["prettyprint", "csv", "json"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+dirs = "6"
+flexi_logger = { version = "0.31", default-features = false }
+futures = "0.3"
+log = "0.4"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "io-std",
+    "io-util",
+    "time",
+] }
+tokio-util = { version = "0.7", default-features = false }
+
+[dev-dependencies]
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+wiremock = "0.6"

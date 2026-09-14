@@ -150,7 +150,7 @@ pub struct NameValueParameter {
     pub value: serde_json::Value,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 // FIXME
 #[allow(dead_code)]
@@ -164,6 +164,46 @@ pub struct LoginResponseData {
     pub session_info: SessionInfo,
     pub master_validity_in_seconds: i64,
     pub validity_in_seconds: i64,
+    /// Present on SSO logins when `CLIENT_STORE_TEMPORARY_CREDENTIAL` was
+    /// requested and the account allows id tokens.
+    #[serde(default)]
+    pub id_token: Option<String>,
+    #[serde(default)]
+    pub id_token_validity_in_seconds: Option<i64>,
+    /// Present on MFA logins when `CLIENT_REQUEST_MFA_TOKEN` was requested
+    /// and the account allows MFA caching.
+    #[serde(default)]
+    pub mfa_token: Option<String>,
+    #[serde(default)]
+    pub mfa_token_validity_in_seconds: Option<i64>,
+}
+
+impl std::fmt::Debug for LoginResponseData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginResponseData")
+            .field("session_id", &self.session_id)
+            .field("token", &"[REDACTED]")
+            .field("master_token", &"[REDACTED]")
+            .field("server_version", &self.server_version)
+            .field("parameters", &self.parameters)
+            .field("session_info", &self.session_info)
+            .field(
+                "master_validity_in_seconds",
+                &self.master_validity_in_seconds,
+            )
+            .field("validity_in_seconds", &self.validity_in_seconds)
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "id_token_validity_in_seconds",
+                &self.id_token_validity_in_seconds,
+            )
+            .field("mfa_token", &self.mfa_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "mfa_token_validity_in_seconds",
+                &self.mfa_token_validity_in_seconds,
+            )
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -187,7 +227,7 @@ pub struct AuthenticatorResponseData {
     pub proof_key: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 // FIXME: dead_code
 #[allow(dead_code)]
@@ -197,6 +237,18 @@ pub struct RenewSessionResponseData {
     pub master_token: String,
     pub validity_in_seconds_m_t: i64,
     pub session_id: i64,
+}
+
+impl std::fmt::Debug for RenewSessionResponseData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenewSessionResponseData")
+            .field("session_token", &"[REDACTED]")
+            .field("validity_in_seconds_s_t", &self.validity_in_seconds_s_t)
+            .field("master_token", &"[REDACTED]")
+            .field("validity_in_seconds_m_t", &self.validity_in_seconds_m_t)
+            .field("session_id", &self.session_id)
+            .finish()
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -332,23 +384,32 @@ pub struct PutGetResponseData {
     #[serde(rename = "src_locations", default)]
     pub src_locations: Vec<String>,
     // file upload parallelism
-    pub parallel: usize, // fixme: originally i32, handle this in parsing somehow?
-    // file size threshold, small ones are should be uploaded with given parallelism
-    pub threshold: i64,
-    // doesn't need compression if source is already compressed
+    #[serde(default = "default_parallel")]
+    pub parallel: usize,
+    // file size threshold, small ones are should be uploaded with given
+    // parallelism. Upload only.
+    #[serde(default)]
+    pub threshold: Option<i64>,
+    // doesn't need compression if source is already compressed. Upload only.
+    #[serde(default)]
     pub auto_compress: bool,
+    #[serde(default)]
     pub overwrite: bool,
-    // maps to one of the predefined compression algos
-    // todo: support different compression formats?
-    pub source_compression: String,
+    // maps to one of the predefined compression algos. Upload only.
+    #[serde(default)]
+    pub source_compression: Option<String>,
     pub stage_info: PutGetStageInfo,
     pub encryption_material: EncryptionMaterialVariant,
-    // GCS specific. If you request multiple files?
+    // GCS specific, one per file; `null` on other clouds.
     #[serde(default)]
-    pub presigned_urls: Vec<String>,
+    pub presigned_urls: Vec<Option<String>>,
     #[serde(default)]
     pub parameters: Vec<NameValueParameter>,
     pub statement_type_id: Option<i64>,
+}
+
+fn default_parallel() -> usize {
+    4
 }
 
 #[derive(Deserialize, Debug)]
@@ -422,10 +483,12 @@ pub struct AzureCredentials {
 #[serde(untagged)]
 pub enum EncryptionMaterialVariant {
     Single(PutGetEncryptionMaterial),
-    Multiple(Vec<PutGetEncryptionMaterial>),
+    /// One entry per `src_locations` element on `GET`; `null` for files the
+    /// server knows are unencrypted.
+    Multiple(Vec<Option<PutGetEncryptionMaterial>>),
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PutGetEncryptionMaterial {
     // base64 encoded

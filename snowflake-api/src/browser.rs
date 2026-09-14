@@ -4,17 +4,16 @@
 //! external browser flow, where the user is redirected to their `IdP` in a browser
 //! and the token is received via a local callback.
 
-use std::io::{BufRead, BufReader, Read as _, Write};
-use std::net::TcpListener;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use url::Url;
 
 const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024;
 /// <https://github.com/snowflakedb/gosnowflake/blob/v2.0.2/internal/config/dsn.go#L33-L34>
 const LISTENER_TIMEOUT: Duration = Duration::from_mins(2);
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Error, Debug)]
 pub enum BrowserAuthError {
@@ -67,11 +66,13 @@ pub fn generate_proof_key() -> String {
     base64::engine::general_purpose::STANDARD.encode(randomness)
 }
 
-/// Create a local TCP listener on localhost with a random available port.
+/// Bind a loopback listener on a random port for the SSO callback.
 ///
 /// Returns the listener and the port it's bound to.
-pub fn create_local_listener() -> Result<(TcpListener, u16), BrowserAuthError> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(BrowserAuthError::BindFailed)?;
+pub async fn create_local_listener() -> Result<(TcpListener, u16), BrowserAuthError> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(BrowserAuthError::BindFailed)?;
 
     let port = listener
         .local_addr()
@@ -85,42 +86,38 @@ pub fn create_local_listener() -> Result<(TcpListener, u16), BrowserAuthError> {
 ///
 /// The callback comes as: `GET /?token=<url_encoded_token> HTTP/1.1`
 ///
-/// Blocks until a connection is received or `LISTENER_TIMEOUT` (120s) expires.
-pub fn wait_for_token(listener: &TcpListener) -> Result<String, BrowserAuthError> {
-    listener
-        .set_nonblocking(true)
+/// Resolves once a connection arrives or `LISTENER_TIMEOUT` (120s) expires.
+/// Dropping the future closes the listener.
+pub async fn wait_for_token(listener: &TcpListener) -> Result<String, BrowserAuthError> {
+    let (stream, _addr) = tokio::time::timeout(LISTENER_TIMEOUT, listener.accept())
+        .await
+        .map_err(|_| BrowserAuthError::Timeout)?
+        .map_err(BrowserAuthError::AcceptFailed)?;
+
+    let mut stream = BufReader::new(stream);
+    let mut request_line = Vec::with_capacity(256);
+    let bytes_read = (&mut stream)
+        .take(MAX_REQUEST_LINE_BYTES as u64)
+        .read_until(b'\n', &mut request_line)
+        .await
         .map_err(BrowserAuthError::ReadFailed)?;
-
-    let deadline = Instant::now() + LISTENER_TIMEOUT;
-
-    let (mut stream, _addr) = loop {
-        match listener.accept() {
-            Ok(conn) => break conn,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(BrowserAuthError::Timeout);
-                }
-                std::thread::sleep(POLL_INTERVAL);
-            }
-            Err(e) => return Err(BrowserAuthError::AcceptFailed(e)),
-        }
-    };
-
-    let limited = (&stream).take(MAX_REQUEST_LINE_BYTES as u64);
-    let mut reader = BufReader::new(limited);
-    let mut request_line = String::new();
-
-    let bytes_read = reader
-        .read_line(&mut request_line)
-        .map_err(BrowserAuthError::ReadFailed)?;
-
     if bytes_read >= MAX_REQUEST_LINE_BYTES {
         return Err(BrowserAuthError::RequestTooLarge);
     }
+    let request_line = String::from_utf8_lossy(&request_line);
 
     let token = extract_token_from_request(&request_line)?;
 
-    let response = "HTTP/1.1 200 OK\r\n\
+    let _ = stream
+        .get_mut()
+        .write_all(CALLBACK_RESPONSE.as_bytes())
+        .await;
+    let _ = stream.get_mut().shutdown().await;
+
+    Ok(token)
+}
+
+const CALLBACK_RESPONSE: &str = "HTTP/1.1 200 OK\r\n\
 Content-Type: text/html\r\n\
 Connection: close\r\n\
 \r\n\
@@ -163,11 +160,6 @@ Connection: close\r\n\
   <script>setTimeout(function() { window.close(); }, 5000);</script>\
 </body>\
 </html>";
-
-    let _ = stream.write_all(response.as_bytes());
-
-    Ok(token)
-}
 
 /// Extract the token from the HTTP request line.
 ///
@@ -282,6 +274,41 @@ mod tests {
             extract_token_from_request(req).unwrap_err(),
             BrowserAuthError::InvalidRequest
         ));
+    }
+
+    #[tokio::test]
+    async fn listener_round_trip_and_timeout_cancel() {
+        let (listener, port) = super::create_local_listener().await.unwrap();
+        let client = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            s.write_all(b"GET /?token=abc%3D%3D&code=1 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).await.unwrap();
+            resp
+        });
+        let token = super::wait_for_token(&listener).await.unwrap();
+        assert_eq!(token, "abc==");
+        let resp = client.await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.contains("Authentication Successful"));
+
+        // An outer timeout cancels the wait; the port is released on drop.
+        let (listener, port) = super::create_local_listener().await.unwrap();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            super::wait_for_token(&listener),
+        )
+        .await;
+        assert!(r.is_err());
+        drop(listener);
+        assert!(tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .is_ok());
     }
 
     #[test]

@@ -1,6 +1,8 @@
 name: Publish firn
 
-# Triggered by pushing a v* tag (e.g. `git tag v0.15.0 && git push origin v0.15.0`).
+# Triggered by pushing a v* tag (e.g. `git tag v0.17.0 && git push origin v0.17.0`).
+# Publishes the `firn` crate, then `firn-cli` (skipped when that version is
+# already on crates.io, so the CLI does not need a bump for every crate release).
 #
 # Setup required (one-time, in crates.io UI):
 #   crates.io/settings/profile -> Trusted Publishers -> Add GitHub publisher
@@ -33,10 +35,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy -p firn --all-features --tests --benches --examples -- -D warnings
+        run: cargo clippy -p firn -p firn-cli --all-features --tests --benches --examples -- -D warnings
 
       - name: cargo test
-        run: cargo test -p firn --all-features --lib
+        run: cargo test -p firn -p firn-cli --all-features
 
       - name: Verify tag matches Cargo.toml version
         run: |
@@ -51,5 +53,14 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
-      - name: cargo publish
+      - name: cargo publish firn
         run: cargo publish -p firn --token ${{ steps.auth.outputs.token }}
+
+      - name: cargo publish firn-cli
+        run: |
+          cli_version=$(cargo pkgid -p firn-cli | sed -E 's/.*[#@]([0-9].*)/\1/')
+          if cargo info "firn-cli@${cli_version}" >/dev/null 2>&1; then
+            echo "firn-cli ${cli_version} is already published; skipping"
+            exit 0
+          fi
+          cargo publish -p firn-cli --token ${{ steps.auth.outputs.token }}

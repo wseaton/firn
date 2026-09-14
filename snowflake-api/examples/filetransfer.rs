@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     ).await?;
 
     log::info!("Uploading CSV file");
-    api.exec(&format!("PUT file://{} @%OSCAR_AGE_MALE;", &args.csv_path))
+    api.exec(&format!("PUT file://{} @%OSCAR_AGE_MALE;", args.csv_path))
         .await?;
 
     log::info!("Create temporary file format");

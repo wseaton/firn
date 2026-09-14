@@ -1,8 +1,6 @@
-#![doc(
-    issue_tracker_base_url = "https://github.com/mycelial/snowflake-rs/issues",
-    test(no_crate_inject)
-)]
-#![doc = include_str ! ("../README.md")]
+//! Key-pair JWT for `AUTHENTICATOR=SNOWFLAKE_JWT`, per
+//! <https://docs.snowflake.com/en/developer-guide/sql-api/authenticating#label-sql-api-authenticating-key-pair>.
+//! Vendored from the `snowflake-jwt` crate (andrusha/snowflake-rs).
 
 use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -70,11 +68,11 @@ impl Claims {
 }
 
 mod jwt_numeric_date {
-    //! Custom serialization of OffsetDateTime to conform with the JWT spec (RFC 7519 section 2, "Numeric Date")
+    //! Custom serialization of `OffsetDateTime` to conform with the JWT spec (RFC 7519 section 2, "Numeric Date")
     use serde::{self, Deserialize, Deserializer, Serializer};
     use time::OffsetDateTime;
 
-    /// Serializes an OffsetDateTime to a Unix timestamp (milliseconds since 1970/1/1T00:00:00T)
+    /// Serializes an `OffsetDateTime` to a Unix timestamp (milliseconds since 1970/1/1T00:00:00T)
     pub fn serialize<S>(date: &OffsetDateTime, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -92,6 +90,9 @@ mod jwt_numeric_date {
             .map_err(|_| serde::de::Error::custom("invalid Unix timestamp value"))
     }
 }
+
+/// Snowflake rejects key-pair JWTs that live longer than an hour.
+const JWT_LIFETIME: Duration = Duration::minutes(59);
 
 fn pubkey_fingerprint(pubkey: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -116,7 +117,7 @@ pub fn generate_jwt_token(
     );
 
     let iat = OffsetDateTime::now_utc();
-    let exp = iat + Duration::days(1);
+    let exp = iat + JWT_LIFETIME;
 
     let claims = Claims::new(iss, full_identifier.to_owned(), iat, exp);
     let ek = EncodingKey::from_rsa_der(pkey.to_pkcs1_der()?.as_bytes());

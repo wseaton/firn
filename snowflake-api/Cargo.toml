@@ -4,7 +4,7 @@ authors = [
     "Will Eaton <me@wseaton.com>",
 ]
 categories = ["api-bindings", "database"]
-description = "snowflake-rs fork: cancellation, async, streaming, multi-statement, bind params, structured types, retry middleware"
+description = "snowflake-rs fork: connections.toml, token caching, MFA/PAT/SSO auth, cancellation, async, streaming, multi-statement, bind params, structured types"
 documentation = "https://docs.rs/firn/"
 edition = "2021"
 keywords = ["snowflake", "database", "api", "arrow", "fork"]
@@ -12,12 +12,15 @@ license = "Apache-2.0"
 name = "firn"
 readme = "README.md"
 repository = "https://github.com/wseaton/firn"
-version = "0.16.0"
+version = "0.17.0"
 
 [features]
-all = ["cert-auth", "polars", "browser-auth"]
-cert-auth = ["dep:snowflake-jwt"]
-browser-auth = ["dep:getrandom", "dep:urlencoding", "dep:open"]
+all = ["cert-auth", "polars", "browser-auth", "keyring"]
+cert-auth = ["dep:jsonwebtoken", "dep:rsa", "dep:pkcs8", "dep:time"]
+browser-auth = ["dep:urlencoding", "dep:open"]
+# OS credential store backend for the token cache (Keychain / Credential
+# Manager / kernel keyutils)
+keyring = ["dep:keyring"]
 default = ["cert-auth"]
 # support for conversion of arrow and json payloads to dataframes
 polars = ["dep:polars-core", "dep:polars-io"]
@@ -25,11 +28,13 @@ polars = ["dep:polars-core", "dep:polars-io"]
 [dependencies]
 arc-swap = "1"
 arrow-array = "58"
+arrow-cast = "58"
 arrow-ipc = "58"
 arrow-schema = "58"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
+dirs = "6"
 futures = "0.3"
 http = "1"
 log = "0.4"
@@ -43,8 +48,13 @@ reqwest-middleware = { version = "0.5", features = ["json"] }
 reqwest-retry = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-snowflake-jwt = { version = "0.3", optional = true }
+sha2 = "0.10"
+jsonwebtoken = { version = "9", optional = true }
+rsa = { version = "0.9", optional = true }
+pkcs8 = { version = "0.10", features = ["encryption", "pem"], optional = true }
+time = { version = "0.3", optional = true }
 thiserror = "2"
+toml = "1"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 
@@ -56,16 +66,29 @@ polars-io = { version = ">=0.41", features = [
 ], optional = true }
 
 # browser-auth support
-getrandom = { version = "0.4", optional = true }
 urlencoding = { version = "2", optional = true }
 open = { version = "5", optional = true }
 
-# put request support
+# put / get support
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+ecb = { version = "0.1", features = ["alloc", "block-padding"] }
+flate2 = "1"
+getrandom = "0.4"
 glob = { version = "0.3" }
 object_store = { version = "0.13", features = ["aws"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 secrecy = { version = "0.10", features = ["serde"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native"], optional = true }
 
 [dev-dependencies]
 anyhow = "1"

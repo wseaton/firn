@@ -39,6 +39,7 @@ struct QueryContext {
     method: Method,
 }
 
+#[derive(Clone)]
 pub enum QueryType {
     LoginRequest,
     AuthenticatorRequest,
@@ -77,7 +78,7 @@ impl QueryType {
                 method: Method::POST,
             },
             Self::TokenRequest => QueryContext {
-                path: Cow::Borrowed("/session/token-request"),
+                path: Cow::Borrowed("session/token-request"),
                 accept_mime: "application/snowflake",
                 method: Method::POST,
             },
@@ -170,10 +171,10 @@ impl Connection {
     ///
     /// Users can provide their own middleware to the connection like this:
     /// ```rust
-    /// use snowflake_api::connection::Connection;
-    /// let mut client = Connection::default_client_builder();
-    ///  // modify the client builder here
-    /// let connection = Connection::new_with_middware(client.unwrap().build());
+    /// use firn::connection::Connection;
+    /// let client = Connection::default_client_builder().unwrap();
+    /// // modify the client builder here
+    /// let connection = Connection::new_with_middware(client.build());
     /// ```
     /// This is not intended to be called directly, but is used by `SnowflakeApiBuilder::with_client`
     pub fn new_with_middware(client: ClientWithMiddleware) -> Self {
@@ -225,7 +226,7 @@ impl Connection {
     pub async fn request<R: serde::de::DeserializeOwned>(
         &self,
         query_type: QueryType,
-        account_identifier: &str,
+        base_url: &Url,
         extra_get_params: &[(&str, &str)],
         auth: Option<&str>,
         body: impl serde::Serialize,
@@ -239,11 +240,8 @@ impl Connection {
         let mut get_params: Vec<(&str, &str)> = vec![("requestId", request_id.as_str())];
         get_params.extend_from_slice(extra_get_params);
 
-        let url = format!(
-            "https://{}.snowflakecomputing.com/{}",
-            &account_identifier, context.path
-        );
-        let url = Url::parse_with_params(&url, get_params)?;
+        let mut url = base_url.join(context.path.trim_start_matches('/'))?;
+        url.query_pairs_mut().extend_pairs(get_params);
 
         let mut headers = HeaderMap::new();
         headers.append(
