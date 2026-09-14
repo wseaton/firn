@@ -125,5 +125,6 @@ official clients show. S3-backed stages only for now.
 `firn auth logout` closes and forgets the session; `--tokens` also drops the
 cached id / MFA tokens.
 
-The screenshots are regenerated with [`assets/render.sh`](./assets/render.sh)
-(needs [freeze](https://github.com/charmbracelet/freeze) and a connection).
+The screenshots are real Ghostty windows captured by
+[`assets/render.sh`](./assets/render.sh) (macOS; needs Ghostty,
+`GetWindowID`, and a connection).
