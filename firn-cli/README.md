@@ -5,21 +5,41 @@ as `snow`, but:
 
 ![firn sql on a terminal: typed, colored table with a Snowsight query link](https://raw.githubusercontent.com/wseaton/firn/stable/firn-cli/assets/table.png)
 
-- **One Snowflake session across calls.** The session and master tokens are
-  saved (0600) and reused; a dead session is renewed or re-created silently.
-- **SSO once, MFA once.** Browser and MFA logins store the `idToken` /
-  `mfaToken` Snowflake hands back (Keychain / Credential Manager, or the
-  Python connector's `credential_cache_v1.json` on Linux) and replay them.
-- **JSON when piped.** Rows as JSON lines on stdout, one metadata line with
-  the `query_id` on stderr, structured errors, distinct exit codes.
-- **Always-on log file**: one line per invocation, connection, session,
-  and query at info; `-vv` for debug, `--trace` for HTTP detail. Secrets
-  are redacted. `firn logs path` tells you where.
-- **Headless** with `--headless`: prints the SSO URL instead of opening a
-  browser.
+One Snowflake session across calls. The session and master tokens are saved
+(0600) and reused; a dead session is renewed or re-created silently.
+
+SSO once, MFA once. Browser and MFA logins store the `idToken` / `mfaToken`
+Snowflake hands back (Keychain / Credential Manager, or the Python connector's
+`credential_cache_v1.json` on Linux) and replay them.
+
+JSON when piped. Rows as JSON lines on stdout, one metadata line with the
+`query_id` on stderr, structured errors, distinct exit codes.
+
+Always-on log file: one line per invocation, connection, session, and query
+at info; `-vv` for debug, `--trace` for HTTP detail. Secrets are redacted.
+`firn logs path` tells you where.
+
+Headless with `--headless`: prints the SSO URL instead of opening a browser.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wseaton/firn/stable/install.sh | sh
+```
+
+Installs the latest release to `~/.local/bin` (`FIRN_INSTALL_DIR` to change,
+`FIRN_VERSION=0.1.2` to pin). Linux (x86_64, aarch64), macOS (Intel, Apple
+silicon) and Windows archives, with a `SHA256SUMS` file, are on the
+[releases page](https://github.com/wseaton/firn/releases?q=cli-v) under the
+`cli-v*` tags. Or build from crates.io:
+
+```sh
+cargo install firn-cli
+```
+
+## Usage
 
 ```text
-cargo install --path firn-cli
 firn connection list
 firn sql "SELECT current_user()"              # table on a TTY
 firn sql "SELECT * FROM t WHERE id = ?" -b 7 | jq .   # jsonl when piped
