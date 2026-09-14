@@ -1,6 +1,6 @@
 [package]
 name = "firn-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Will Eaton <me@wseaton.com>"]
 description = "Snowflake CLI built for agents: one session across calls, cached SSO and MFA tokens, JSON output, always-on logs"
